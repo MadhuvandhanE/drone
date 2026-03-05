@@ -72,18 +72,37 @@ class _MJPEGVisionThread(threading.Thread):
     """
     Captures frames from the chosen camera, annotates them with YOLO,
     and pushes JPEG bytes into FRAME_STORE so the MJPEG endpoint can serve them.
+
+    Performance design
+    ------------------
+    CAPTURE_FPS (25)  – how fast frames are grabbed from the camera and
+                        pushed to FRAME_STORE.  Drives the smooth video.
+    INFER_FPS   (8)   – how often YOLO actually runs.  Last known detections
+                        are reused for every frame between inference calls so
+                        bounding boxes stay on screen without re-running YOLO.
+
+    SAHI tiling
+    -----------
+    A single YOLO pass on a 640×480 frame won't see a person who is only
+    5-10 pixels tall (drone altitude).  SAHI fixes this by splitting the
+    frame into four overlapping 60%×60% tiles and running YOLO on each.
+    Each tile is upscaled ~1.7× by the model, making tiny targets visible.
+    Duplicate detections from overlapping tiles are removed with NMS.
+    SAHI is automatically disabled on CPU to keep fps usable.
     """
 
-    CONF_THRESH  = 0.35          # aerial-tuned: catch partially visible victims
-    IOU_THRESH   = 0.50
-    IMGSZ        = 960           # high-res input preserves small aerial targets
+    CONF_THRESH  = 0.30          # low threshold — aerial targets are partially occluded
+    IOU_THRESH   = 0.45          # NMS: suppress overlapping boxes
+    INFER_IMGSZ  = 640           # per-pass image size (5 passes at 640 = SAHI tiling)
     DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+    SAHI_ENABLED = torch.cuda.is_available()   # tiling only when GPU is available
     BOX_COLOR    = (0, 240, 255)   # cyan (BGR)
-    TARGET_FPS   = 10              # intentionally low — keeps CPU usage manageable
-    JPEG_QUALITY = 65              # lower = smaller payload, less bandwidth
+    CAPTURE_FPS  = 25              # stream / annotation rate
+    INFER_FPS    = 8               # YOLO inference rate
+    JPEG_QUALITY = 72              # slightly higher quality for sharper bounding boxes
+
     def __init__(self, stream_source):
         super().__init__(daemon=True, name="jarvis-mjpeg")
-        # stream_source: int (camera index) or str (URL / IP camera / RTSP)
         self.stream_source = stream_source
         self._stop_event   = threading.Event()
         self._model        = None
@@ -99,10 +118,11 @@ class _MJPEGVisionThread(threading.Thread):
             import os
             base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             model_path = os.path.join(base, "yolov8n.pt")
-            print(f"[STREAM] Loading YOLO from {model_path} on {self.DEVICE} …")
+            mode = "SAHI tiling" if self.SAHI_ENABLED else "single-pass"
+            print(f"[STREAM] Loading YOLO from {model_path} on {self.DEVICE} ({mode}) …")
             self._model = YOLO(model_path)
             self._model.to(self.DEVICE)
-            print(f"[STREAM] YOLO ready ✓  (device={self.DEVICE}, imgsz={self.IMGSZ}, conf={self.CONF_THRESH})")
+            print(f"[STREAM] YOLO ready ✓  conf={self.CONF_THRESH} imgsz={self.INFER_IMGSZ} fps={self.INFER_FPS}")
 
     def run(self):
         self._load_model()
@@ -113,72 +133,144 @@ class _MJPEGVisionThread(threading.Thread):
 
         cap = cv2.VideoCapture(src, cv2.CAP_DSHOW) if isinstance(src, int) \
               else cv2.VideoCapture(src)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)   # keep low to save CPU
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS,          self.TARGET_FPS)
+        cap.set(cv2.CAP_PROP_FPS,          self.CAPTURE_FPS)
         cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
         if not cap.isOpened():
             print(f"[STREAM] ERROR: Cannot open source → {src}")
             return
 
-        print(f"[STREAM] Camera opened → {src}")
-        interval   = 1.0 / self.TARGET_FPS
-        last_infer = 0.0      # throttle YOLO to at most 10fps independently
+        print(f"[STREAM] Camera opened → {src}  capture={self.CAPTURE_FPS}fps  infer={self.INFER_FPS}fps")
+
+        capture_interval = 1.0 / self.CAPTURE_FPS
+        infer_interval   = 1.0 / self.INFER_FPS
+        last_infer       = 0.0
+        last_detections: list[tuple] = []   # carried between inference calls
 
         while not self._stop_event.is_set():
             t0 = time.perf_counter()
 
             ret, frame = cap.read()
             if not ret:
-                time.sleep(0.05)
+                time.sleep(0.02)
                 continue
 
-            # YOLO inference – persons only (throttled)
-            now       = time.perf_counter()
-            detections = []
-            if now - last_infer >= interval:   # only infer at TARGET_FPS rate
-                results    = self._model(
-                    frame,
-                    classes = [0],
-                    conf    = self.CONF_THRESH,
-                    iou     = self.IOU_THRESH,
-                    imgsz   = self.IMGSZ,
-                    device  = self.DEVICE,
-                    verbose = False,
-                )
-                last_infer = now
-                raw: list[dict] = []
-                for r in results:
-                    for box in r.boxes:
-                        conf = float(box.conf[0])
-                        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-                        detections.append((x1, y1, x2, y2, conf))
-                        raw.append({
-                            "label":      "person",
-                            "confidence": round(conf, 2),
-                            "bbox":       [x1, y1, x2 - x1, y2 - y1],
-                        })
-                # Expose detections globally so /detections endpoint reads them
+            # ── YOLO inference (throttled to INFER_FPS) ───────────────────
+            now = time.perf_counter()
+            if now - last_infer >= infer_interval:
+                last_detections = self._infer(frame)
                 global LIVE_DETECTIONS
-                LIVE_DETECTIONS = raw
+                LIVE_DETECTIONS = [
+                    {
+                        "label":      "person",
+                        "confidence": round(d[4], 2),
+                        "bbox":       [d[0], d[1], d[2] - d[0], d[3] - d[1]],
+                    }
+                    for d in last_detections
+                ]
+                last_infer = now
 
-            annotated = self._annotate(frame, detections)
+            # ── Annotate every frame with last known detections ────────────
+            annotated = self._annotate(frame, last_detections)
 
-            # Encode to JPEG (low quality = fast)
             ok, buf = cv2.imencode(
                 ".jpg", annotated,
-                [cv2.IMWRITE_JPEG_QUALITY, self.JPEG_QUALITY]
+                [cv2.IMWRITE_JPEG_QUALITY, self.JPEG_QUALITY],
             )
             if ok:
                 FRAME_STORE.put(buf.tobytes())
 
-            elapsed   = time.perf_counter() - t0
-            sleep_for = max(0.0, interval - elapsed)
-            time.sleep(sleep_for)
+            elapsed = time.perf_counter() - t0
+            time.sleep(max(0.0, capture_interval - elapsed))
 
         cap.release()
         print("[STREAM] Camera released.")
+
+    # ── SAHI Inference ────────────────────────────────────────────────────────
+
+    def _infer(self, frame: cv2.Mat) -> list[tuple]:
+        """
+        Run YOLO with optional SAHI tiling for aerial small-target detection.
+
+        Returns list of (x1, y1, x2, y2, conf) in full-frame pixel coords.
+
+        SAHI strategy
+        -------------
+        Full-frame pass  → catches medium/close persons
+        2×2 tiled passes → each tile is ~60% of the frame with 20% overlap,
+                           upscaled by the model → tiny aerial targets visible
+        NMS → removes duplicates from overlapping tiles
+        """
+        if self.SAHI_ENABLED:
+            return self._infer_sahi(frame)
+        return self._infer_single(frame, 0, 0)
+
+    def _infer_single(self, img: cv2.Mat, ox: int, oy: int) -> list[tuple]:
+        """Run one YOLO pass on img; translate results by (ox, oy) offset."""
+        results = self._model(
+            img,
+            classes = [0],
+            conf    = self.CONF_THRESH,
+            iou     = self.IOU_THRESH,
+            imgsz   = self.INFER_IMGSZ,
+            device  = self.DEVICE,
+            verbose = False,
+        )
+        dets = []
+        for r in results:
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
+                dets.append((x1 + ox, y1 + oy, x2 + ox, y2 + oy, conf))
+        return dets
+
+    def _infer_sahi(self, frame: cv2.Mat) -> list[tuple]:
+        """Full-frame + 2×2 overlapping tile passes merged with NMS."""
+        h, w = frame.shape[:2]
+        all_dets = []
+
+        # Pass 1: full frame (catches nearby / medium persons)
+        all_dets.extend(self._infer_single(frame, 0, 0))
+
+        # Passes 2-5: 2×2 tiles with 20% overlap
+        tw = int(w * 0.60)   # tile width  (~60% = zoom ×1.67)
+        th = int(h * 0.60)   # tile height
+        sx = (w - tw) // 1   # stride so two cols cover full width
+        sy = (h - th) // 1
+
+        for row in range(2):
+            for col in range(2):
+                ox = col * (w - tw)
+                oy = row * (h - th)
+                tile = frame[oy : oy + th, ox : ox + tw]
+                all_dets.extend(self._infer_single(tile, ox, oy))
+
+        return self._nms(all_dets, iou_thresh=self.IOU_THRESH)
+
+    def _nms(self, dets: list[tuple], iou_thresh: float = 0.45) -> list[tuple]:
+        """Greedy NMS: sort by confidence, suppress lower-conf overlapping boxes."""
+        if not dets:
+            return []
+        boxes = sorted(dets, key=lambda d: d[4], reverse=True)
+        kept  = []
+        while boxes:
+            best = boxes.pop(0)
+            kept.append(best)
+            boxes = [b for b in boxes if self._iou(best, b) < iou_thresh]
+        return kept
+
+    @staticmethod
+    def _iou(a: tuple, b: tuple) -> float:
+        ax1, ay1, ax2, ay2, _ = a
+        bx1, by1, bx2, by2, _ = b
+        ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        a_area = (ax2 - ax1) * (ay2 - ay1)
+        b_area = (bx2 - bx1) * (by2 - by1)
+        return inter / (a_area + b_area - inter + 1e-6)
 
     def _annotate(self, frame, detections):
         out = frame.copy()
@@ -194,38 +286,26 @@ class _MJPEGVisionThread(threading.Thread):
                 (x1, y1,  1,  1), (x2, y1, -1,  1),
                 (x1, y2,  1, -1), (x2, y2, -1, -1),
             ]:
-                cv2.line(out, (px, py), (px + dx * bk, py),      self.BOX_COLOR, th)
+                cv2.line(out, (px, py), (px + dx * bk, py),          self.BOX_COLOR, th)
                 cv2.line(out, (px, py), (px,            py + dy * bk), self.BOX_COLOR, th)
 
             # Label
             label = f" PERSON  {conf:.0%} "
-            (lw, lh), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-            cv2.rectangle(out,
-                          (x1, y1 - lh - 10), (x1 + lw + 4, y1),
-                          self.BOX_COLOR, -1)
+            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+            cv2.rectangle(out, (x1, y1 - lh - 10), (x1 + lw + 4, y1), self.BOX_COLOR, -1)
             cv2.putText(out, label, (x1 + 2, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                        (0, 0, 0), 1, cv2.LINE_AA)
-
-        # Scanline vignette (subtle)
-        overlay = out.copy()
-        for y in range(0, h, 4):
-            overlay[y, :] = (overlay[y, :] * 0.6).astype("uint8")
-        cv2.addWeighted(overlay, 0.12, out, 0.88, 0, out)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
 
         # HUD watermark
         ts = time.strftime("%H:%M:%S")
         cv2.putText(out, f"JARVIS VISION  |  CAM-1  |  {ts}",
-                    (10, h - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.BOX_COLOR, 1, cv2.LINE_AA)
+                    (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.BOX_COLOR, 1, cv2.LINE_AA)
 
-        det_count = len(detections)
+        det_count    = len(detections)
         status_color = (0, 230, 118) if det_count == 0 else (0, 240, 255)
-        cv2.putText(out,
-                    f"TARGETS: {det_count}",
-                    (w - 120, h - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1, cv2.LINE_AA)
+        sahi_tag     = " SAHI" if self.SAHI_ENABLED else ""
+        cv2.putText(out, f"TARGETS: {det_count}{sahi_tag}",
+                    (w - 150, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1, cv2.LINE_AA)
         return out
 
 
@@ -285,6 +365,41 @@ async def stream_status():
     running = _vision_thread is not None and _vision_thread.is_alive()
     has_frame = FRAME_STORE.latest() is not None
     return {"running": running, "has_frame": has_frame}
+
+
+@router.get("/snapshot", summary="Single JPEG frame (Flutter web compatible)")
+async def video_snapshot():
+    """
+    Returns the latest annotated frame as a single JPEG image.
+
+    Use this instead of /feed when running Flutter on web — Flutter web's
+    Image.network() cannot decode MJPEG multipart streams, but handles
+    plain JPEG responses perfectly.  Poll this endpoint with a cache-busting
+    query param to achieve a smooth frame refresh:
+
+        Image.network('http://localhost:8000/video/snapshot?t=$cacheBust')
+    """
+    from fastapi.responses import Response
+    frame_bytes = FRAME_STORE.latest()
+
+    if frame_bytes is None:
+        # Return the no-signal placeholder so the widget always gets a valid image
+        import numpy as np
+        placeholder = _make_no_signal_frame()
+        ok, buf = cv2.imencode(".jpg", placeholder,
+                               [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ok:
+            return Response(status_code=503)
+        frame_bytes = buf.tobytes()
+
+    return Response(
+        content=frame_bytes,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @router.get("/feed", summary="MJPEG live feed")

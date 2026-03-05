@@ -7,7 +7,6 @@
 /// pipeline starts automatically — no manual step needed.
 library;
 
-import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -16,6 +15,7 @@ import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 
 import '../core/config.dart';
+import '../platform/mjpeg_view.dart';
 import '../services/telemetry_service.dart';
 import 'detection_overlay.dart';
 
@@ -32,11 +32,6 @@ class _LiveFeedPanelState extends State<LiveFeedPanel>
   bool _streamStarted = false;
   bool _streamError = false;
   String _errorMsg = '';
-
-  // MJPEG refresh: we use an Image.network() with a cache-busting timestamp
-  // query param, refreshed at ~20 fps via a timer.
-  Timer? _refreshTimer;
-  int _cacheBust = 0;
 
   // Pulse animation for the LIVE dot
   late AnimationController _pulseCtrl;
@@ -63,7 +58,6 @@ class _LiveFeedPanelState extends State<LiveFeedPanel>
 
   @override
   void dispose() {
-    _refreshTimer?.cancel();
     _pulseCtrl.dispose();
     super.dispose();
   }
@@ -86,14 +80,6 @@ class _LiveFeedPanelState extends State<LiveFeedPanel>
             _streamStarted = true;
             _streamError = false;
           });
-          // Kick off the cache-bust timer so the Image.network() refreshes
-          _refreshTimer?.cancel();
-          _refreshTimer = Timer.periodic(
-            const Duration(milliseconds: 50), // 20 fps
-            (_) {
-              if (mounted) setState(() => _cacheBust++);
-            },
-          );
         }
       } else {
         _setError('Backend error ${res.statusCode}');
@@ -263,23 +249,10 @@ class _LiveFeedPanelState extends State<LiveFeedPanel>
       return _buildLoadingScreen();
     }
 
-    // MJPEG stream via cache-busted Image.network
-    // Flutter's Image.network handles the multipart MJPEG response by showing
-    // the latest decoded frame each time the URL changes (cache-bust param).
-    final url = '${AppConfig.mjpegFeedUrl}?t=$_cacheBust';
-
-    return Image.network(
-      url,
-      fit: BoxFit.cover,
-      gaplessPlayback: true, // no flicker between frames
-      errorBuilder: (_, error, __) => _buildErrorScreen(
-        msg: 'Stream decode error.\n$error',
-      ),
-      loadingBuilder: (_, child, loadingProgress) {
-        if (loadingProgress == null) return child;
-        return _buildLoadingScreen();
-      },
-    );
+    // Web: MjpegView embeds a native HTML <img> that decodes the MJPEG
+    // multipart stream in one persistent TCP connection — true real-time fps.
+    // Non-web: MjpegView stubs to snapshot polling (see lib/platform/).
+    return MjpegView(streamUrl: AppConfig.mjpegFeedUrl);
   }
 
   Widget _buildLoadingScreen() {

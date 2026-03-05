@@ -30,8 +30,14 @@ class AppConfig {
   // Example Peeper/Skydroid TX10 RTSP URL: 'rtsp://192.168.144.108:554/stream=0'
   // WebRTC/HLS from Hive Backend (Future): 'http://localhost:8000/stream.m3u8'
   /// MJPEG stream served by the Hive backend (/video/feed).
-  /// This is what the LiveFeedPanel widget renders.
+  /// Works natively in browsers via <img> tag, but NOT via Flutter web
+  /// Image.network() — use snapshotUrl for Flutter web instead.
   static String get mjpegFeedUrl => '$baseUrl/video/feed';
+
+  /// Single JPEG snapshot endpoint — Flutter web compatible.
+  /// Poll this with a cache-busting query param to simulate a live feed:
+  ///   Image.network('$snapshotUrl?t=$cacheBust')
+  static String get snapshotUrl => '$baseUrl/video/snapshot';
 
   /// Convenience: POST this URL with {"source":"0"} to start the camera.
   static String get videoStartUrl => '$baseUrl/video/start';
