@@ -4,6 +4,11 @@
 <dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<!-- Location permission strings required by geolocator on iOS -->
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>JARVIS uses your location to simulate drone GPS position on the tactical map.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>JARVIS tracks your location in the background to keep the drone marker updated.</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

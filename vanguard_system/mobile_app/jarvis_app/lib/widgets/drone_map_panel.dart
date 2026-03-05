@@ -1,9 +1,21 @@
+﻿/// Drone Map Panel
+/// ===============
+/// Tactical satellite map using the Google Maps Flutter SDK.
+///
+/// Data priority
+/// -------------
+/// 1. Phone GPS (LocationService)  â€” real device, best accuracy
+/// 2. Backend GPS (DroneLocationService) â€” phone_client.py simulation
+/// 3. Simulated telemetry (TelemetryService) â€” offline fallback
+library;
+
 import 'package:flutter/material.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:provider/provider.dart';
+
 import '../services/telemetry_service.dart';
+import '../services/location_service.dart';
 import '../services/drone_location_service.dart';
 import '../core/config.dart';
 
@@ -17,240 +29,153 @@ class DroneMapPanel extends StatefulWidget {
 }
 
 class _DroneMapPanelState extends State<DroneMapPanel> {
-  final MapController _mapController = MapController();
-  final List<LatLng> _positionHistory = [];
-  late final List<LatLng> _waypoints;
-  DroneLocationService? _locationService;
+  GoogleMapController? _mapController;
 
-  @override
-  void initState() {
-    super.initState();
-    _waypoints =
-        AppConfig.patrolWaypoints.map((wp) => LatLng(wp[0], wp[1])).toList();
-  }
+  /// Up to 200 consecutive GPS positions â†’ drawn as cyan polyline trail.
+  final List<LatLng> _trail = [];
 
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    // Re-attach listener whenever the dependency tree changes.
-    _locationService?.removeListener(_onGpsUpdate);
-    _locationService = context.read<DroneLocationService>();
-    _locationService!.addListener(_onGpsUpdate);
-  }
+  /// Last position placed on the map (avoids redundant camera moves).
+  LatLng _dronePos = LatLng(AppConfig.mapInitialLat, AppConfig.mapInitialLng);
 
-  /// Called by DroneLocationService whenever a new GPS fix arrives.
-  void _onGpsUpdate() {
-    if (!mounted) return;
-    final loc = _locationService;
-    if (loc == null || !loc.hasLocation) return;
-
-    final pos = LatLng(loc.latitude!, loc.longitude!);
-    if (_positionHistory.isEmpty || _positionHistory.last != pos) {
-      setState(() {
-        _positionHistory.add(pos);
-        if (_positionHistory.length > 150) _positionHistory.removeAt(0);
-      });
-    }
-    // Smoothly follow the drone whenever GPS updates.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        _mapController.move(pos, _mapController.camera.zoom);
-      }
-    });
-  }
-
-  @override
-  void didUpdateWidget(covariant DroneMapPanel oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // Phone GPS takes priority — only update trail from telemetry as a fallback.
-    if (_locationService?.hasLocation ?? false) return;
-    if (!widget.service.isConnected) return;
-
-    final t = widget.service.telemetry;
-    final pos = LatLng(t.latitude, t.longitude);
-    if (_positionHistory.isEmpty || _positionHistory.last != pos) {
-      _positionHistory.add(pos);
-      if (_positionHistory.length > 50) _positionHistory.removeAt(0);
-    }
-  }
+  final Map<MarkerId,   Marker>   _markers   = {};
+  final Map<PolylineId, Polyline> _polylines = {};
+  bool _mapReady = false;
 
   @override
   void dispose() {
-    _locationService?.removeListener(_onGpsUpdate);
+    _mapController?.dispose();
     super.dispose();
   }
 
+  // â”€â”€ Position resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  LatLng _resolvePosition() {
+    final gps = context.read<LocationService>();
+    if (gps.hasPosition) return LatLng(gps.latitude!, gps.longitude!);
+
+    final backend = context.read<DroneLocationService>();
+    if (backend.hasLocation) return LatLng(backend.latitude!, backend.longitude!);
+
+    final t = widget.service.telemetry;
+    return LatLng(t.latitude, t.longitude);
+  }
+
+  String _sourceLabel() {
+    final gps = context.read<LocationService>();
+    if (gps.hasPosition) return 'GPS LIVE';
+    final b = context.read<DroneLocationService>();
+    if (b.hasLocation && b.source != 'default') return 'PHONE SIM';
+    return 'SIMULATED';
+  }
+
+  Color _sourceColor() {
+    final gps = context.read<LocationService>();
+    if (gps.hasPosition) return const Color(0xFF00E676);
+    final b = context.read<DroneLocationService>();
+    if (b.hasLocation && b.source != 'default') return const Color(0xFFFFD740);
+    return const Color(0xFF00E5FF);
+  }
+
+  // â”€â”€ Map update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  void _updateMap(LatLng pos) {
+    if (!mounted || !_mapReady) return;
+
+    if (_trail.isEmpty || _trail.last != pos) {
+      _trail.add(pos);
+      if (_trail.length > 200) _trail.removeAt(0);
+    }
+
+    const mid = MarkerId('drone');
+    setState(() {
+      _dronePos = pos;
+      _markers[mid] = Marker(
+        markerId: mid,
+        position: pos,
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
+        infoWindow: const InfoWindow(title: 'Drone', snippet: 'Live position'),
+        zIndexInt: 10,
+      );
+      if (_trail.length >= 2) {
+        const pid = PolylineId('trail');
+        _polylines[pid] = Polyline(
+          polylineId: pid,
+          points: List.from(_trail),
+          color: const Color(0xFF00E5FF),
+          width: 3,
+        );
+      }
+    });
+
+    _mapController?.animateCamera(CameraUpdate.newLatLng(pos));
+  }
+
+  void _onMapCreated(GoogleMapController c) {
+    _mapController = c;
+    setState(() => _mapReady = true);
+    _updateMap(_dronePos);
+  }
+
+  // â”€â”€ Build â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
   @override
   Widget build(BuildContext context) {
-    final t = widget.service.telemetry;
+    context.watch<LocationService>();
+    context.watch<DroneLocationService>();
 
-    // Phone GPS has priority; fall back to simulated telemetry when offline.
-    final loc = context.watch<DroneLocationService>();
-    final hasRealGps = loc.hasLocation;
-    final dronePos = hasRealGps
-        ? LatLng(loc.latitude!, loc.longitude!)
-        : LatLng(t.latitude, t.longitude);
-    final hasTelemetry = hasRealGps || widget.service.isConnected;
+    final pos   = _resolvePosition();
+    final label = _sourceLabel();
+    final color = _sourceColor();
 
-    // When no phone GPS, auto-follow simulated drone.
-    if (!hasRealGps && widget.service.isConnected) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _mapController.move(dronePos, _mapController.camera.zoom);
-      });
-    }
-
-    // Build Victims markers
-    final victimMarkers = <Marker>[];
-    if (widget.service.detections != null) {
-      final victims =
-          widget.service.detections!['victims'] as List<dynamic>? ?? [];
-      for (var v in victims) {
-        final victim = v as Map<String, dynamic>;
-        final lat = (victim['lat'] as num?)?.toDouble() ?? 0;
-        final lon = (victim['lon'] as num?)?.toDouble() ?? 0;
-
-        victimMarkers.add(Marker(
-          point: LatLng(lat, lon),
-          width: 30,
-          height: 30,
-          child: const Icon(
-            Icons.person_pin_circle,
-            color: Color(0xFFFF6E40),
-            size: 24,
-          ),
-        ));
-      }
-    }
+    WidgetsBinding.instance.addPostFrameCallback((_) => _updateMap(pos));
 
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF0D1B2A),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: const Color(0xFF00E5FF).withValues(alpha: 0.3),
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.5),
-            blurRadius: 10,
-          ),
-        ],
+        border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.3)),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 10)],
       ),
       clipBehavior: Clip.hardEdge,
       child: Stack(
         children: [
-          FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCenter:
-                  LatLng(AppConfig.mapInitialLat, AppConfig.mapInitialLng),
-              initialZoom: AppConfig.mapInitialZoom,
-              interactionOptions: const InteractionOptions(
-                  flags: InteractiveFlag
-                      .none), // Locking interaction for dashboard
+          // â”€â”€ Google Map â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          GoogleMap(
+            onMapCreated: _onMapCreated,
+            initialCameraPosition: CameraPosition(
+              target: LatLng(AppConfig.mapInitialLat, AppConfig.mapInitialLng),
+              zoom: AppConfig.mapInitialZoom,
             ),
-            children: [
-              TileLayer(
-                urlTemplate: AppConfig.mapTileUrl,
-                subdomains: const ['a', 'b', 'c', 'd'],
-                maxZoom: 20,
-              ),
-
-              // Planned route (Dashed)
-              PolylineLayer<Object>(
-                polylines: [
-                  Polyline<Object>(
-                    points: _waypoints,
-                    color: const Color(0xFF7C4DFF).withValues(alpha: 0.6),
-                    strokeWidth: 2,
-                  ),
-                ],
-              ),
-
-              // Drone trail (Actual path)
-              if (_positionHistory.length >= 2)
-                PolylineLayer<Object>(
-                  polylines: [
-                    Polyline<Object>(
-                      points: List.from(_positionHistory),
-                      color: const Color(0xFF00E5FF).withValues(alpha: 0.8),
-                      strokeWidth: 4,
-                    ),
-                  ],
-                ),
-
-              // Rescue Waypoints (Current & Target)
-              MarkerLayer(
-                markers: [
-                  // Currently moving towards
-                  if (t.currentWaypoint > 0 &&
-                      t.currentWaypoint <= _waypoints.length)
-                    Marker(
-                      point: _waypoints[t.currentWaypoint - 1],
-                      width: 20,
-                      height: 20,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF00E676).withValues(alpha: 0.3),
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                              color: const Color(0xFF00E676), width: 2),
-                        ),
-                        child: const Center(
-                          child: Icon(Icons.location_searching,
-                              size: 12, color: Colors.white),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-
-              // Victims
-              if (victimMarkers.isNotEmpty) MarkerLayer(markers: victimMarkers),
-
-              // Drone Marker
-              if (hasTelemetry)
-                MarkerLayer(
-                  markers: [
-                    Marker(
-                      point: dronePos,
-                      width: 40,
-                      height: 40,
-                      child: Icon(
-                        Icons.flight,
-                        color: const Color(0xFF00E5FF),
-                        size: 28,
-                      ),
-                    ),
-                  ],
-                ),
-            ],
+            mapType: MapType.satellite,
+            style: _darkMapStyle,
+            markers: Set<Marker>.of(_markers.values),
+            polylines: Set<Polyline>.of(_polylines.values),
+            myLocationEnabled: false,
+            zoomControlsEnabled: false,
+            mapToolbarEnabled: false,
+            compassEnabled: false,
           ),
 
-          // Label Overlay
+          // â”€â”€ GPS source badge â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           Positioned(
-            top: 10,
-            left: 10,
+            top: 10, left: 10,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.6),
-                border: Border.all(
-                    color: const Color(0xFF00E5FF).withValues(alpha: 0.3)),
+                color: Colors.black.withValues(alpha: 0.65),
+                border: Border.all(color: color.withValues(alpha: 0.5)),
                 borderRadius: BorderRadius.circular(4),
               ),
               child: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.satellite_alt,
-                      color: Color(0xFF00E5FF), size: 12),
+                  Icon(Icons.satellite_alt, color: color, size: 12),
                   const SizedBox(width: 6),
                   Text(
-                    hasRealGps ? 'GPS LIVE' : 'TACTICAL MAP',
+                    label,
                     style: GoogleFonts.rajdhani(
-                      color: hasRealGps
-                          ? const Color(0xFF00E676)
-                          : const Color(0xFF00E5FF),
-                      fontSize: 10,
+                      color: color,
+                      fontSize: 11,
                       fontWeight: FontWeight.bold,
                       letterSpacing: 1,
                     ),
@@ -260,10 +185,9 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
             ),
           ),
 
-          // Stats Minimap Overlay
+          // â”€â”€ Coordinates readout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           Positioned(
-            bottom: 10,
-            left: 10,
+            bottom: 10, left: 10,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
@@ -272,17 +196,61 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
                 borderRadius: BorderRadius.circular(4),
               ),
               child: Text(
-                'TARGET WP: ${t.currentWaypoint}',
+                '${pos.latitude.toStringAsFixed(5)},  ${pos.longitude.toStringAsFixed(5)}',
                 style: GoogleFonts.sourceCodePro(
-                  color: Colors.white,
-                  fontSize: 10,
+                  color: Colors.white70,
+                  fontSize: 9,
                   fontWeight: FontWeight.bold,
                 ),
               ),
             ),
           ),
+
+          // â”€â”€ Loading overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          if (!_mapReady)
+            Container(
+              color: const Color(0xFF0D1B2A),
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation(Color(0xFF00E5FF)),
+                      strokeWidth: 2,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'LOADING MAPâ€¦',
+                      style: GoogleFonts.sourceCodePro(
+                        color: const Color(0xFF00E5FF).withValues(alpha: 0.7),
+                        fontSize: 11,
+                        letterSpacing: 2,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
       ),
     );
   }
 }
+
+// â”€â”€ Dark tactical Google Maps style â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const String _darkMapStyle = '''
+[
+  {"elementType":"geometry","stylers":[{"color":"#0d1117"}]},
+  {"elementType":"labels.text.fill","stylers":[{"color":"#4a6377"}]},
+  {"elementType":"labels.text.stroke","stylers":[{"color":"#080d14"}]},
+  {"featureType":"administrative","elementType":"geometry","stylers":[{"color":"#1a2942"}]},
+  {"featureType":"administrative.country","elementType":"labels.text.fill","stylers":[{"color":"#5c8aaa"}]},
+  {"featureType":"administrative.locality","elementType":"labels.text.fill","stylers":[{"color":"#6fa8c8"}]},
+  {"featureType":"poi","elementType":"labels.text.fill","stylers":[{"color":"#3a5468"}]},
+  {"featureType":"poi.park","elementType":"geometry","stylers":[{"color":"#0a1a10"}]},
+  {"featureType":"road","elementType":"geometry","stylers":[{"color":"#1a2942"}]},
+  {"featureType":"road.highway","elementType":"geometry","stylers":[{"color":"#1f4068"}]},
+  {"featureType":"transit","elementType":"geometry","stylers":[{"color":"#0f1f30"}]},
+  {"featureType":"water","elementType":"geometry","stylers":[{"color":"#0a111a"}]}
+]
+''';
