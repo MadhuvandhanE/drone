@@ -1,0 +1,30 @@
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.env
+# Keep .env.example (template), ignore actual secrets
+!.env.example
+
+# ── YOLOv8 / ML ─────────────────────────────────────────────────
+# Keep yolov8n.pt tracked (small model, shared across team)
+# Exclude larger fine-tuned checkpoints
+runs/
+*.pt.backup
+
+# ── IDE / OS ─────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ── Flutter (backend root) ───────────────────────────────────────
+# Flutter has its own .gitignore under mobile_app/jarvis_app/
