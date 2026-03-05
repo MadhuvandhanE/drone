@@ -19,6 +19,7 @@ import 'package:provider/provider.dart';
 
 import 'services/telemetry_service.dart';
 import 'services/drone_location_service.dart';
+import 'services/location_service.dart';
 import 'screens/dashboard_screen.dart';
 import 'screens/map_screen.dart';
 import 'screens/mission_screen.dart';
@@ -52,6 +53,7 @@ class JarvisApp extends StatelessWidget {
       providers: [
         ChangeNotifierProvider(create: (_) => TelemetryService()),
         ChangeNotifierProvider(create: (_) => DroneLocationService()),
+        ChangeNotifierProvider(create: (_) => LocationService()),
       ],
       child: MaterialApp(
         title: 'JARVIS',
@@ -106,6 +108,7 @@ class _JarvisHomeState extends State<JarvisHome> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<TelemetryService>().startPolling();
       context.read<DroneLocationService>().startPolling();
+      context.read<LocationService>().startTracking();
     });
   }
 

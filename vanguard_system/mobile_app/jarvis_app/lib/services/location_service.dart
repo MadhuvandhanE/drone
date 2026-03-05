@@ -1,117 +1,75 @@
-/// Location Service
+﻿/// Location Service
 /// ================
-/// Reads the phone's real GPS via the geolocator package and exposes it
-/// as a [ChangeNotifier].  Also forwards every fix to the Hive backend
-/// (POST /update_location) so the tactical map stays in sync.
+/// Reads the phone real GPS via geolocator and exposes it as a ChangeNotifier.
+/// Used to simulate drone location with the phone GPS while the real drone
+/// is not yet connected.
 ///
 /// Usage
 /// -----
-///   context.read<LocationService>().startTracking();
-///
-/// The service is already wired into the MultiProvider tree in main.dart.
+///   ChangeNotifierProvider(create: (_) => LocationService()),  // in MultiProvider
+///   context.read<LocationService>().startTracking();            // in initState
+///   final svc = context.watch<LocationService>();
+///   if (svc.hasPosition) print('${svc.latitude}, ${svc.longitude}');
 library;
 
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
-import '../core/config.dart';
+import '../models/location_model.dart';
 
 class LocationService extends ChangeNotifier {
-  // ── State ──────────────────────────────────────────────────────────────────
-  Position? _position;
-  bool _permissionGranted = false;
+  // --- State ----------------------------------------------------------------
+  LocationModel? _location;
   bool _tracking = false;
   String? _error;
 
-  StreamSubscription<Position>? _posStream;
+  StreamSubscription<Position>? _sub;
 
-  // ── Getters ────────────────────────────────────────────────────────────────
+  // --- Getters --------------------------------------------------------------
 
-  Position? get position        => _position;
-  double?   get latitude        => _position?.latitude;
-  double?   get longitude       => _position?.longitude;
-  double?   get accuracy        => _position?.accuracy;
-  double?   get altitude        => _position?.altitude;
-  double?   get heading         => _position?.heading;
-  double?   get speed           => _position?.speed;
-  bool      get permissionGranted => _permissionGranted;
-  bool      get isTracking      => _tracking;
-  String?   get error           => _error;
+  LocationModel? get location  => _location;
+  double?  get latitude  => _location?.latitude;
+  double?  get longitude => _location?.longitude;
+  double?  get accuracy  => _location?.accuracy;
+  double?  get altitude  => _location?.altitude;
+  double?  get heading   => _location?.heading;
+  double?  get speed     => _location?.speed;
 
-  /// True once we have at least one real GPS fix.
-  bool get hasPosition => _position != null;
+  /// True once at least one real GPS fix has arrived.
+  bool    get hasPosition => _location != null;
+  bool    get isTracking  => _tracking;
+  String? get error       => _error;
 
-  // ── Permission ─────────────────────────────────────────────────────────────
+  // --- Public API -----------------------------------------------------------
 
-  /// Request (or check existing) location permission.
-  /// Returns true if permission is granted.
-  Future<bool> requestPermission() async {
-    // Services enabled?
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      _error = 'Location services are disabled on this device.';
-      notifyListeners();
-      return false;
-    }
-
-    LocationPermission perm = await Geolocator.checkPermission();
-
-    if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
-    }
-
-    if (perm == LocationPermission.deniedForever) {
-      _error = 'Location permission permanently denied. '
-               'Open Settings → App → Location.';
-      notifyListeners();
-      return false;
-    }
-
-    if (perm == LocationPermission.denied) {
-      _error = 'Location permission denied.';
-      notifyListeners();
-      return false;
-    }
-
-    _permissionGranted = true;
-    _error = null;
-    notifyListeners();
-    return true;
-  }
-
-  // ── Tracking ───────────────────────────────────────────────────────────────
-
-  /// Start continuous GPS tracking.  Requests permission if needed.
+  /// Request permission and start streaming GPS fixes (~1 Hz).
+  /// Safe to call multiple times; subsequent calls are no-ops.
   Future<void> startTracking() async {
     if (_tracking) return;
-
-    final ok = await requestPermission();
+    final ok = await _requestPermission();
     if (!ok) return;
 
     const settings = LocationSettings(
       accuracy: LocationAccuracy.high,
-      distanceFilter: 0,   // receive every update regardless of movement
+      distanceFilter: 0, // fire every update regardless of movement
     );
 
-    _posStream = Geolocator.getPositionStream(locationSettings: settings)
-        .listen(
-          _onPosition,
-          onError: (e) {
-            _error = e.toString();
-            notifyListeners();
-          },
-        );
+    _sub = Geolocator.getPositionStream(locationSettings: settings).listen(
+      _onPosition,
+      onError: (Object e) {
+        _error = e.toString();
+        notifyListeners();
+      },
+    );
 
     _tracking = true;
     notifyListeners();
   }
 
-  /// Stop GPS tracking.
+  /// Cancel the GPS stream.
   void stopTracking() {
-    _posStream?.cancel();
-    _posStream = null;
+    _sub?.cancel();
+    _sub = null;
     _tracking = false;
     notifyListeners();
   }
@@ -122,36 +80,45 @@ class LocationService extends ChangeNotifier {
     super.dispose();
   }
 
-  // ── Internal ───────────────────────────────────────────────────────────────
+  // --- Internals ------------------------------------------------------------
 
-  void _onPosition(Position pos) {
-    _position = pos;
+  Future<bool> _requestPermission() async {
+    final enabled = await Geolocator.isLocationServiceEnabled();
+    if (!enabled) {
+      _error = 'Location services are disabled on this device.';
+      notifyListeners();
+      return false;
+    }
+
+    LocationPermission perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if (perm == LocationPermission.deniedForever) {
+      _error = 'Location permanently denied. Open Settings -> App -> Location.';
+      notifyListeners();
+      return false;
+    }
+    if (perm == LocationPermission.denied) {
+      _error = 'Location permission denied.';
+      notifyListeners();
+      return false;
+    }
     _error = null;
-    notifyListeners();
-    _postToBackend(pos);  // fire-and-forget
+    return true;
   }
 
-  /// Push the latest GPS fix to the Hive backend so the tactical map and any
-  /// other clients (e.g. recording service) get the real-time position.
-  Future<void> _postToBackend(Position pos) async {
-    try {
-      await http
-          .post(
-            Uri.parse(AppConfig.updateLocationUrl),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'latitude':  pos.latitude,
-              'longitude': pos.longitude,
-              'accuracy':  pos.accuracy,
-              'altitude':  pos.altitude,
-              'heading':   pos.heading,
-              'speed':     pos.speed,
-              'source':    'phone_gps',
-            }),
-          )
-          .timeout(const Duration(seconds: 2));
-    } catch (_) {
-      // Backend unreachable — GPS tracking continues regardless.
-    }
+  void _onPosition(Position pos) {
+    _location = LocationModel(
+      latitude:  pos.latitude,
+      longitude: pos.longitude,
+      accuracy:  pos.accuracy,
+      altitude:  pos.altitude,
+      heading:   pos.heading,
+      speed:     pos.speed,
+      timestamp: pos.timestamp,
+    );
+    _error = null;
+    notifyListeners();
   }
 }

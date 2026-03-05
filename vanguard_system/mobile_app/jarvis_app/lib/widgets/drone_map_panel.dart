@@ -1,17 +1,19 @@
 ﻿/// Drone Map Panel
 /// ===============
-/// Tactical satellite map using the Google Maps Flutter SDK.
+/// Dashboard map widget using flutter_map + OpenStreetMap tiles.
+/// Free, no API key required.
 ///
-/// Data priority
-/// -------------
-/// 1. Phone GPS (LocationService)  â€” real device, best accuracy
-/// 2. Backend GPS (DroneLocationService) â€” phone_client.py simulation
-/// 3. Simulated telemetry (TelemetryService) â€” offline fallback
+/// Data priority for drone position simulation
+/// -------------------------------------------
+/// 1. Phone GPS (LocationService)             – real device, best accuracy
+/// 2. Backend GPS (DroneLocationService)      – phone_client.py simulation
+/// 3. Simulated telemetry (TelemetryService)  – offline fallback
 library;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 
 import '../services/telemetry_service.dart';
@@ -21,7 +23,6 @@ import '../core/config.dart';
 
 class DroneMapPanel extends StatefulWidget {
   final TelemetryService service;
-
   const DroneMapPanel({super.key, required this.service});
 
   @override
@@ -29,25 +30,14 @@ class DroneMapPanel extends StatefulWidget {
 }
 
 class _DroneMapPanelState extends State<DroneMapPanel> {
-  GoogleMapController? _mapController;
+  final MapController _mapController = MapController();
 
-  /// Up to 200 consecutive GPS positions â†’ drawn as cyan polyline trail.
+  /// Trail of up to 200 GPS positions -- drawn as a cyan polyline.
   final List<LatLng> _trail = [];
 
-  /// Last position placed on the map (avoids redundant camera moves).
   LatLng _dronePos = LatLng(AppConfig.mapInitialLat, AppConfig.mapInitialLng);
 
-  final Map<MarkerId,   Marker>   _markers   = {};
-  final Map<PolylineId, Polyline> _polylines = {};
-  bool _mapReady = false;
-
-  @override
-  void dispose() {
-    _mapController?.dispose();
-    super.dispose();
-  }
-
-  // â”€â”€ Position resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // --- Position helpers ----------------------------------------------------
 
   LatLng _resolvePosition() {
     final gps = context.read<LocationService>();
@@ -76,47 +66,19 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
     return const Color(0xFF00E5FF);
   }
 
-  // â”€â”€ Map update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // --- Map update ----------------------------------------------------------
 
   void _updateMap(LatLng pos) {
-    if (!mounted || !_mapReady) return;
-
+    if (!mounted) return;
     if (_trail.isEmpty || _trail.last != pos) {
       _trail.add(pos);
       if (_trail.length > 200) _trail.removeAt(0);
     }
-
-    const mid = MarkerId('drone');
-    setState(() {
-      _dronePos = pos;
-      _markers[mid] = Marker(
-        markerId: mid,
-        position: pos,
-        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
-        infoWindow: const InfoWindow(title: 'Drone', snippet: 'Live position'),
-        zIndexInt: 10,
-      );
-      if (_trail.length >= 2) {
-        const pid = PolylineId('trail');
-        _polylines[pid] = Polyline(
-          polylineId: pid,
-          points: List.from(_trail),
-          color: const Color(0xFF00E5FF),
-          width: 3,
-        );
-      }
-    });
-
-    _mapController?.animateCamera(CameraUpdate.newLatLng(pos));
+    setState(() => _dronePos = pos);
+    _mapController.move(pos, _mapController.camera.zoom);
   }
 
-  void _onMapCreated(GoogleMapController c) {
-    _mapController = c;
-    setState(() => _mapReady = true);
-    _updateMap(_dronePos);
-  }
-
-  // â”€â”€ Build â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // --- Build ---------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
@@ -139,24 +101,54 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
       clipBehavior: Clip.hardEdge,
       child: Stack(
         children: [
-          // â”€â”€ Google Map â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-          GoogleMap(
-            onMapCreated: _onMapCreated,
-            initialCameraPosition: CameraPosition(
-              target: LatLng(AppConfig.mapInitialLat, AppConfig.mapInitialLng),
-              zoom: AppConfig.mapInitialZoom,
+          // -- OpenStreetMap tile layer -------------------------------------
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: _dronePos,
+              initialZoom: AppConfig.mapInitialZoom,
+              interactionOptions: const InteractionOptions(
+                flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
+              ),
             ),
-            mapType: MapType.satellite,
-            style: _darkMapStyle,
-            markers: Set<Marker>.of(_markers.values),
-            polylines: Set<Polyline>.of(_polylines.values),
-            myLocationEnabled: false,
-            zoomControlsEnabled: false,
-            mapToolbarEnabled: false,
-            compassEnabled: false,
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.example.jarvis_app',
+              ),
+
+              // Trail polyline
+              if (_trail.length >= 2)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: List.from(_trail),
+                      color: const Color(0xFF00E5FF),
+                      strokeWidth: 3,
+                    ),
+                  ],
+                ),
+
+              // Drone marker
+              MarkerLayer(
+                markers: [
+                  Marker(
+                    point: _dronePos,
+                    width: 36,
+                    height: 36,
+                    child: const Icon(
+                      Icons.location_on,
+                      color: Color(0xFF2196F3),
+                      size: 36,
+                      shadows: [Shadow(color: Colors.black54, blurRadius: 6)],
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
 
-          // â”€â”€ GPS source badge â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          // -- GPS source badge ---------------------------------------------
           Positioned(
             top: 10, left: 10,
             child: Container(
@@ -185,7 +177,7 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
             ),
           ),
 
-          // â”€â”€ Coordinates readout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          // -- Coordinates readout ------------------------------------------
           Positioned(
             bottom: 10, left: 10,
             child: Container(
@@ -205,52 +197,8 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
               ),
             ),
           ),
-
-          // â”€â”€ Loading overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-          if (!_mapReady)
-            Container(
-              color: const Color(0xFF0D1B2A),
-              child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const CircularProgressIndicator(
-                      valueColor: AlwaysStoppedAnimation(Color(0xFF00E5FF)),
-                      strokeWidth: 2,
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      'LOADING MAPâ€¦',
-                      style: GoogleFonts.sourceCodePro(
-                        color: const Color(0xFF00E5FF).withValues(alpha: 0.7),
-                        fontSize: 11,
-                        letterSpacing: 2,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
         ],
       ),
     );
   }
 }
-
-// â”€â”€ Dark tactical Google Maps style â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-const String _darkMapStyle = '''
-[
-  {"elementType":"geometry","stylers":[{"color":"#0d1117"}]},
-  {"elementType":"labels.text.fill","stylers":[{"color":"#4a6377"}]},
-  {"elementType":"labels.text.stroke","stylers":[{"color":"#080d14"}]},
-  {"featureType":"administrative","elementType":"geometry","stylers":[{"color":"#1a2942"}]},
-  {"featureType":"administrative.country","elementType":"labels.text.fill","stylers":[{"color":"#5c8aaa"}]},
-  {"featureType":"administrative.locality","elementType":"labels.text.fill","stylers":[{"color":"#6fa8c8"}]},
-  {"featureType":"poi","elementType":"labels.text.fill","stylers":[{"color":"#3a5468"}]},
-  {"featureType":"poi.park","elementType":"geometry","stylers":[{"color":"#0a1a10"}]},
-  {"featureType":"road","elementType":"geometry","stylers":[{"color":"#1a2942"}]},
-  {"featureType":"road.highway","elementType":"geometry","stylers":[{"color":"#1f4068"}]},
-  {"featureType":"transit","elementType":"geometry","stylers":[{"color":"#0f1f30"}]},
-  {"featureType":"water","elementType":"geometry","stylers":[{"color":"#0a111a"}]}
-]
-''';
