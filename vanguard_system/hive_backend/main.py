@@ -22,6 +22,7 @@ from api.mission_api import router as mission_router
 from api.detection_api import router as detection_router
 from api.vision_api import router as vision_router
 from api.stream_api import router as stream_router
+from api.location_api import router as location_router
 
 # ---------------------------------------------------------------------------
 # Application factory
@@ -65,6 +66,7 @@ app.include_router(mission_router)
 app.include_router(detection_router)
 app.include_router(vision_router)
 app.include_router(stream_router)
+app.include_router(location_router)
 
 
 # ---------------------------------------------------------------------------

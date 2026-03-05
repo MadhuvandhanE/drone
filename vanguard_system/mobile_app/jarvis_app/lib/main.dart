@@ -18,6 +18,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import 'services/telemetry_service.dart';
+import 'services/drone_location_service.dart';
 import 'screens/dashboard_screen.dart';
 import 'screens/map_screen.dart';
 import 'screens/mission_screen.dart';
@@ -47,8 +48,11 @@ class JarvisApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => TelemetryService(),
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => TelemetryService()),
+        ChangeNotifierProvider(create: (_) => DroneLocationService()),
+      ],
       child: MaterialApp(
         title: 'JARVIS',
         debugShowCheckedModeBanner: false,
@@ -101,6 +105,7 @@ class _JarvisHomeState extends State<JarvisHome> {
     // Start telemetry polling when app launches
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<TelemetryService>().startPolling();
+      context.read<DroneLocationService>().startPolling();
     });
   }
 

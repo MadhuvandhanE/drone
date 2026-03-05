@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:provider/provider.dart';
 import '../services/telemetry_service.dart';
+import '../services/drone_location_service.dart';
 import '../core/config.dart';
 
 class DroneMapPanel extends StatefulWidget {
@@ -18,6 +20,7 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
   final MapController _mapController = MapController();
   final List<LatLng> _positionHistory = [];
   late final List<LatLng> _waypoints;
+  DroneLocationService? _locationService;
 
   @override
   void initState() {
@@ -27,36 +30,72 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Re-attach listener whenever the dependency tree changes.
+    _locationService?.removeListener(_onGpsUpdate);
+    _locationService = context.read<DroneLocationService>();
+    _locationService!.addListener(_onGpsUpdate);
+  }
+
+  /// Called by DroneLocationService whenever a new GPS fix arrives.
+  void _onGpsUpdate() {
+    if (!mounted) return;
+    final loc = _locationService;
+    if (loc == null || !loc.hasLocation) return;
+
+    final pos = LatLng(loc.latitude!, loc.longitude!);
+    if (_positionHistory.isEmpty || _positionHistory.last != pos) {
+      setState(() {
+        _positionHistory.add(pos);
+        if (_positionHistory.length > 150) _positionHistory.removeAt(0);
+      });
+    }
+    // Smoothly follow the drone whenever GPS updates.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _mapController.move(pos, _mapController.camera.zoom);
+      }
+    });
+  }
+
+  @override
   void didUpdateWidget(covariant DroneMapPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // Phone GPS takes priority — only update trail from telemetry as a fallback.
+    if (_locationService?.hasLocation ?? false) return;
     if (!widget.service.isConnected) return;
 
     final t = widget.service.telemetry;
     final pos = LatLng(t.latitude, t.longitude);
-
-    // Update path tail
     if (_positionHistory.isEmpty || _positionHistory.last != pos) {
       _positionHistory.add(pos);
-      if (_positionHistory.length > 50) {
-        _positionHistory.removeAt(0);
-      }
+      if (_positionHistory.length > 50) _positionHistory.removeAt(0);
     }
+  }
+
+  @override
+  void dispose() {
+    _locationService?.removeListener(_onGpsUpdate);
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final t = widget.service.telemetry;
-    final dronePos = LatLng(t.latitude, t.longitude);
-    final hasTelemetry = widget.service.isConnected;
 
-    // Follow the drone tightly since this is a tactical minimap
-    if (hasTelemetry) {
-      // Don't animate every tick, let map flutter map handle micro moves or just quick set
+    // Phone GPS has priority; fall back to simulated telemetry when offline.
+    final loc = context.watch<DroneLocationService>();
+    final hasRealGps = loc.hasLocation;
+    final dronePos = hasRealGps
+        ? LatLng(loc.latitude!, loc.longitude!)
+        : LatLng(t.latitude, t.longitude);
+    final hasTelemetry = hasRealGps || widget.service.isConnected;
+
+    // When no phone GPS, auto-follow simulated drone.
+    if (!hasRealGps && widget.service.isConnected) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        // use bounds or map center
-        if (mounted) {
-          _mapController.move(dronePos, 16.5);
-        }
+        if (mounted) _mapController.move(dronePos, _mapController.camera.zoom);
       });
     }
 
@@ -206,9 +245,11 @@ class _DroneMapPanelState extends State<DroneMapPanel> {
                       color: Color(0xFF00E5FF), size: 12),
                   const SizedBox(width: 6),
                   Text(
-                    'TACTICAL MAP',
+                    hasRealGps ? 'GPS LIVE' : 'TACTICAL MAP',
                     style: GoogleFonts.rajdhani(
-                      color: const Color(0xFF00E5FF),
+                      color: hasRealGps
+                          ? const Color(0xFF00E676)
+                          : const Color(0xFF00E5FF),
                       fontSize: 10,
                       fontWeight: FontWeight.bold,
                       letterSpacing: 1,

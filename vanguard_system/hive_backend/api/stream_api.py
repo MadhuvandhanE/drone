@@ -127,22 +127,15 @@ class _MJPEGVisionThread(threading.Thread):
     def run(self):
         self._load_model()
 
-        src = self.stream_source
-        if isinstance(src, str) and src.isdigit():
-            src = int(src)
+        from vision.video_source import VideoSource
+        cap = VideoSource(self.stream_source, reconnect=True)
+        cap.configure(width=640, height=480, fps=self.CAPTURE_FPS)
 
-        cap = cv2.VideoCapture(src, cv2.CAP_DSHOW) if isinstance(src, int) \
-              else cv2.VideoCapture(src)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS,          self.CAPTURE_FPS)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        if not cap.is_open():
+            print(f"[STREAM] ERROR: Cannot open source → {cap.source_label}")
+            # Don't return immediately — VideoSource will keep retrying on read()
 
-        if not cap.isOpened():
-            print(f"[STREAM] ERROR: Cannot open source → {src}")
-            return
-
-        print(f"[STREAM] Camera opened → {src}  capture={self.CAPTURE_FPS}fps  infer={self.INFER_FPS}fps")
+        print(f"[STREAM] Camera → {cap.source_label}  capture={self.CAPTURE_FPS}fps  infer={self.INFER_FPS}fps")
 
         capture_interval = 1.0 / self.CAPTURE_FPS
         infer_interval   = 1.0 / self.INFER_FPS
@@ -153,8 +146,8 @@ class _MJPEGVisionThread(threading.Thread):
             t0 = time.perf_counter()
 
             ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.02)
+            if not ret or frame is None:
+                time.sleep(0.04)
                 continue
 
             # ── YOLO inference (throttled to INFER_FPS) ───────────────────
@@ -186,7 +179,7 @@ class _MJPEGVisionThread(threading.Thread):
             time.sleep(max(0.0, capture_interval - elapsed))
 
         cap.release()
-        print("[STREAM] Camera released.")
+        print(f"[STREAM] Released → {cap.source_label}")
 
     # ── SAHI Inference ────────────────────────────────────────────────────────
 

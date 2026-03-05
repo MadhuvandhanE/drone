@@ -15,6 +15,9 @@ class AppConfig {
   /// Polling interval for telemetry updates (milliseconds).
   static const int telemetryPollIntervalMs = 1000;
 
+  /// Polling interval for drone GPS location updates (milliseconds).
+  static const int locationPollIntervalMs = 1000;
+
   /// App display name.
   static const String appName = 'JARVIS';
 
@@ -45,6 +48,25 @@ class AppConfig {
   /// Legacy – kept so nothing else breaks.
   static String get liveVideoUrl => mjpegFeedUrl;
   static const bool isRtspStream = false;
+
+  /// ---------------------------------------------------------------
+  /// Phone RTSP stream
+  /// ---------------------------------------------------------------
+  /// Update [phoneIp] to your phone's LAN IP before connecting.
+  /// IP Webcam RTSP:  rtsp://[phone-ip]:8080/h264_ulaw.sdp
+  /// DroidCam RTSP:   rtsp://[phone-ip]:4747/mjpegfeed
+  static const String phoneIp = '192.168.1.100'; // ← change to your phone's IP
+  static String get phoneRtspUrl => 'rtsp://$phoneIp:8080/h264_ulaw.sdp';
+
+  /// ---------------------------------------------------------------
+  /// Drone Location (GPS)
+  /// ---------------------------------------------------------------
+
+  /// GET  /drone_location  — Flutter polls this every second.
+  static String get droneLocationUrl => '$baseUrl/drone_location';
+
+  /// POST /update_location — phone client pushes GPS here every second.
+  static String get updateLocationUrl => '$baseUrl/update_location';
 
   /// ---------------------------------------------------------------
   /// Map Configuration (No API Key Required)
